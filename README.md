@@ -83,9 +83,20 @@ wget https://raw.githubusercontent.com/Jimmo910/client_mcp_vanessa_proxy/main/mc
 
 После правки `.mcp.json` — перезапустить Claude Code (или выполнить `/mcp` → переподключить `vanessa`).
 
-## Переменные окружения
+## Переменные окружения (все опциональные)
 
-Размещаются в секции `"env":{}` записи `vanessa` в `.mcp.json`:
+**Все переменные имеют разумные дефолты — если у тебя стандартная установка (1С локально, порт 9874, демо-БД ERP с Vanessa Automation), секцию `"env":{}` в `.mcp.json` можно не указывать вообще, всё заработает.**
+
+Переопределять имеет смысл только если ты меняешь стандартные значения (другой порт MCP, другой путь лога, нестандартный backend без 27 VA-инструментов и т.п.).
+
+| Переменная | По умолчанию | Когда нужно переопределять |
+|---|---|---|
+| `MCP_BACKEND_URL` | `http://localhost:9874/mcp` | Если меняешь `mcpPort` в `/C "runMcp;mcpPort=N"` или backend не на localhost. |
+| `MCP_PROXY_LOG` | `/tmp/mcp-proxy-reconnect.log` | Хочешь логи в другом месте. |
+| `MCP_PROXY_WAIT_TOOLS_MIN` | `5` | Backend регистрирует меньше инструментов чем 5 (например, у VA их 27 — порог 5 ловит «backend готов»). Если у тебя backend без VA — может потребоваться `1`. |
+| `MCP_PROXY_WAIT_TOOLS_TIMEOUT` | `120` | Регистрация tools после рестарта 1С занимает больше 120 сек (большая ERP с длинным «Обновлением ИБ»). |
+
+Если всё-таки нужно переопределить — размещаются в секции `"env":{}` записи `vanessa` в `.mcp.json`:
 
 ```json
 "vanessa": {
@@ -93,23 +104,14 @@ wget https://raw.githubusercontent.com/Jimmo910/client_mcp_vanessa_proxy/main/mc
   "command": "/Users/you/.local/bin/uv",
   "args": ["run", "--script", "/путь/к/mcp-proxy-reconnect.py"],
   "env": {
-    "MCP_BACKEND_URL": "http://localhost:9874/mcp",
-    "MCP_PROXY_LOG": "/tmp/mcp-proxy-reconnect.log",
-    "MCP_PROXY_WAIT_TOOLS_MIN": "5",
-    "MCP_PROXY_WAIT_TOOLS_TIMEOUT": "120"
+    "MCP_BACKEND_URL": "http://localhost:9876/mcp",
+    "MCP_PROXY_WAIT_TOOLS_TIMEOUT": "300"
   },
   "timeout": 300
 }
 ```
 
-| Переменная | По умолчанию | Назначение |
-|---|---|---|
-| `MCP_BACKEND_URL` | `http://localhost:9874/mcp` | Адрес HTTP-сервера client_mcp в 1С. Должен совпадать с `mcpPort` в параметре `/C "runMcp"`. |
-| `MCP_PROXY_LOG` | `/tmp/mcp-proxy-reconnect.log` | Файл лога (события реконнекта, ошибки). |
-| `MCP_PROXY_WAIT_TOOLS_MIN` | `5` | Минимальное число инструментов в `tools/list` после реконнекта — прокси дожидается этого порога прежде чем повторить исходный запрос. У VA регистрируется 27 инструментов, поэтому 5 — достаточный порог «backend готов». |
-| `MCP_PROXY_WAIT_TOOLS_TIMEOUT` | `120` | Сколько секунд максимум ждать регистрации инструментов после реконнекта. На свежей БД ERP с `Обновление ИБ` может потребоваться 60+ секунд. |
-
-Если задавать только через shell (без `.mcp.json`) — переменные нужно экспортировать в окружении, **из которого запущен сам Claude Code**, потому что Claude Code наследует env при старте stdio-серверов:
+Альтернатива — экспорт в shell, **из которого запущен сам Claude Code** (CC наследует env при старте stdio-серверов):
 ```bash
 export MCP_BACKEND_URL=http://localhost:9876/mcp
 claude  # запускаем Claude Code из этого же шелла
