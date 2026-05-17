@@ -189,4 +189,4 @@ MIT.
 
 ## История
 
-Сделан в ходе разработки расширения 1С:ERP (задача 19165 в Б24, приватная). Зафиксирован как issue в апстриме `client_mcp`: [#11](https://github.com/1c-neurofish/onec-client-mcp-devkit/issues/11). В `master` `client_mcp` уже исправлена связанная проблема [PR #10 dynamic tool registration](https://github.com/1c-neurofish/onec-client-mcp-devkit/pull/10) (мерж 2026-05-01) — при выходе релиза с этим фиксом отпадёт необходимость в `wait-for-tools` при первом старте, но прокси по-прежнему полезен для переживания рестартов 1С.
+Сделан в ходе разработки расширения 1С:ERP. Зафиксирован как issue в апстриме `client_mcp`: [#11](https://github.com/1c-neurofish/onec-client-mcp-devkit/issues/11). В `master` `client_mcp` уже исправлена связанная проблема [PR #10 dynamic tool registration](https://github.com/1c-neurofish/onec-client-mcp-devkit/pull/10) (мерж 2026-05-01) — при выходе релиза с этим фиксом отпадёт необходимость в `wait-for-tools` при первом старте, но прокси по-прежнему полезен для переживания рестартов 1С.
