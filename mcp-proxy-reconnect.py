@@ -46,8 +46,22 @@ import httpx
 BACKEND_URL = os.environ.get("MCP_BACKEND_URL", "http://localhost:9874/mcp")
 LOG_FILE = os.environ.get("MCP_PROXY_LOG", "/tmp/mcp-proxy-reconnect.log")
 
-RECONNECT_RETRIES = 8
-RECONNECT_DELAYS = [0.5, 1, 2, 4, 8, 16, 30, 30]  # seconds
+# Disk caches of the last successful initialize / tools/list responses.
+# Replayed (with id substituted) to Claude Code when 1C is not running, so
+# the MCP connection always looks alive from CC's side — no /mcp reconnect needed.
+INIT_CACHE_FILE = os.environ.get(
+    "MCP_PROXY_INIT_CACHE", "/tmp/mcp-vanessa-init-cache.json"
+)
+TOOLS_CACHE_FILE = os.environ.get(
+    "MCP_PROXY_TOOLS_CACHE", "/tmp/mcp-vanessa-tools-cache.json"
+)
+
+# Quick probe on initialize: if backend doesn't answer fast — respond with stub
+# right away, defer real connect until user actually calls a tool.
+INIT_PROBE_TIMEOUT_SEC = float(os.environ.get("MCP_PROXY_INIT_PROBE", "3"))
+
+RECONNECT_RETRIES = 4
+RECONNECT_DELAYS = [1, 2, 4, 8]  # seconds — total ~15s worst case
 
 # After initialize backend MCP server has only base tools (e.g. infobase_info).
 # Vanessa Automation EPF registers ~25 more tools asynchronously when it
@@ -77,9 +91,76 @@ class ProxyState:
     def __init__(self) -> None:
         self.session_id: str | None = None
         self.cached_initialize: dict | None = None  # raw request from CC
+        # When False — backend is unreachable; we serve init/tools/list from
+        # disk cache. Next tool call triggers a real connect attempt.
+        self.backend_ready: bool = False
 
     def reset(self) -> None:
         self.session_id = None
+        self.backend_ready = False
+
+
+def _save_response_cache(path: str, response: dict) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(response, fh, ensure_ascii=False)
+    except OSError as exc:
+        LOG.warning("Could not save cache %s: %s", path, exc)
+
+
+def _load_response_cache(path: str) -> dict | None:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _stub_initialize_response(request: dict) -> dict:
+    """Replay last successful initialize, or fall back to a minimal stub."""
+    cached = _load_response_cache(INIT_CACHE_FILE)
+    if cached is not None:
+        cached["id"] = request.get("id")
+        return cached
+    params = request.get("params") or {}
+    return {
+        "jsonrpc": "2.0",
+        "id": request.get("id"),
+        "result": {
+            "protocolVersion": params.get("protocolVersion", "2025-03-26"),
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "vanessa (offline stub)", "version": "0.0"},
+        },
+    }
+
+
+def _stub_tools_list_response(request: dict) -> dict:
+    """Replay last successful tools/list, or empty list when no cache."""
+    cached = _load_response_cache(TOOLS_CACHE_FILE)
+    if cached is not None:
+        cached["id"] = request.get("id")
+        return cached
+    return {
+        "jsonrpc": "2.0",
+        "id": request.get("id"),
+        "result": {"tools": []},
+    }
+
+
+def _backend_down_error(request: dict, detail: str) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": request.get("id"),
+        "error": {
+            "code": -32000,
+            "message": (
+                "Vanessa MCP backend (1С client_mcp на localhost:9874) недоступен. "
+                "Запусти 1С через `.claude/skills/vanessa-bdd-deploy/scripts/run.sh start --db <путь>` "
+                "и повтори вызов — /mcp reconnect не нужен. "
+                f"Детали: {detail}"
+            ),
+        },
+    }
 
 
 async def write_stdout(obj: dict) -> None:
@@ -228,6 +309,7 @@ async def call_backend_with_reconnect(
             if new_session:
                 state.session_id = new_session
 
+            state.backend_ready = True
             return _parse_response(response)
 
         except (
@@ -247,6 +329,19 @@ async def call_backend_with_reconnect(
             )
             state.reset()
             await asyncio.sleep(delay)
+            # After a ConnectError, the next attempt would send the original
+            # request without a session_id — useless for everything except
+            # `initialize`. Try to spin up a fresh session first.
+            if request.get("method") != "initialize" and state.cached_initialize:
+                try:
+                    await _do_initialize(client, state)
+                    await _send_initialized_notification(client, state)
+                    await _wait_for_tools(client, state)
+                except Exception as init_exc:  # noqa: BLE001
+                    LOG.debug(
+                        "Inline reinit after ConnectError failed: %s",
+                        init_exc.__class__.__name__,
+                    )
 
     raise RuntimeError(f"Backend unavailable after {RECONNECT_RETRIES} attempts: {last_error}")
 
@@ -270,44 +365,134 @@ async def read_stdin_lines():
             LOG.error("Invalid JSON on stdin: %s | line=%r", exc, text)
 
 
+async def _probe_backend_initialize(
+    client: httpx.AsyncClient, state: ProxyState, request: dict
+) -> dict | None:
+    """Quick initialize probe: short timeout, no retries. Returns response or None."""
+    state.reset()
+    try:
+        response = await client.post(
+            BACKEND_URL,
+            json=request,
+            headers=_build_headers(state),
+            timeout=INIT_PROBE_TIMEOUT_SEC,
+        )
+        response.raise_for_status()
+        new_session = response.headers.get("Mcp-Session-Id")
+        if new_session:
+            state.session_id = new_session
+        parsed = _parse_response(response)
+        if parsed is not None:
+            state.backend_ready = True
+        return parsed
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning(
+            "Init probe to backend failed (%s) — serving stub init to CC",
+            exc.__class__.__name__,
+        )
+        return None
+
+
 async def handle_request(
     client: httpx.AsyncClient, state: ProxyState, request: dict
 ) -> None:
     method = request.get("method", "<no-method>")
-    req_id = request.get("id")
+    is_notification = "id" not in request
 
-    # Cache initialize for reconnect path.
+    # ---- initialize ---------------------------------------------------------
+    # Always respond fast. Try backend with a short probe; on failure return a
+    # stubbed (or cached) response so CC sees the MCP as connected.
     if method == "initialize":
         state.cached_initialize = dict(request)
         LOG.info("Cached initialize request from Claude Code")
+        response = await _probe_backend_initialize(client, state, request)
+        if response is not None:
+            _save_response_cache(INIT_CACHE_FILE, response)
+            await write_stdout(response)
+            # Send the initialized notification + wait for VA tools to register.
+            await _send_initialized_notification(client, state)
+            await _wait_for_tools(client, state)
+        else:
+            stub = _stub_initialize_response(request)
+            await write_stdout(stub)
+        return
 
-    is_notification = "id" not in request
+    # ---- notifications/initialized -----------------------------------------
+    # Forward if backend is alive; swallow silently otherwise.
+    if method == "notifications/initialized":
+        if state.backend_ready:
+            try:
+                await client.post(
+                    BACKEND_URL,
+                    json=request,
+                    headers=_build_headers(state),
+                    timeout=5,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("forwarding notifications/initialized failed: %s", exc)
+        return
+
+    # ---- tools/list ---------------------------------------------------------
+    # If backend down, replay cached list so CC keeps the toolset visible.
+    if method == "tools/list":
+        if not state.backend_ready:
+            await _try_lazy_reconnect(client, state)
+        if state.backend_ready:
+            try:
+                response = await call_backend_with_reconnect(client, request, state)
+                if response is not None and "result" in response:
+                    _save_response_cache(TOOLS_CACHE_FILE, response)
+                if response is not None:
+                    await write_stdout(response)
+                    return
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("tools/list against live backend failed: %s", exc)
+                state.reset()
+        # fall through to cached / empty stub
+        await write_stdout(_stub_tools_list_response(request))
+        return
+
+    # ---- all other methods (tools/call, ping, etc.) ------------------------
+    if not state.backend_ready:
+        reconnected = await _try_lazy_reconnect(client, state)
+        if not reconnected and not is_notification:
+            await write_stdout(_backend_down_error(request, "lazy reconnect failed"))
+            return
+
     try:
         response = await call_backend_with_reconnect(client, request, state)
-
-        # Note: tools/list is NOT blocked here. Claude Code has a tight
-        # default timeout on tools/list; waiting longer than that makes CC
-        # abandon the connection. Instead we ensure tools are ready BEFORE
-        # CC ever connects, via vanessa-bdd-deploy wait-mcp script which
-        # polls tools/list count itself.
-
     except Exception as exc:  # noqa: BLE001
-        LOG.exception("Failed to call backend: %s", exc)
+        LOG.warning("Backend call failed: %s", exc)
+        state.reset()
         if not is_notification:
-            await write_stdout(
-                {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32603, "message": f"Proxy error: {exc}"},
-                }
-            )
+            await write_stdout(_backend_down_error(request, str(exc)))
         return
 
     if is_notification:
-        return  # don't echo notifications back to CC
+        return
     if response is None:
         return
     await write_stdout(response)
+
+
+async def _try_lazy_reconnect(
+    client: httpx.AsyncClient, state: ProxyState
+) -> bool:
+    """Try to (re)initialize backend silently. True if backend is now alive."""
+    if state.cached_initialize is None:
+        LOG.debug("Lazy reconnect skipped — no cached initialize")
+        return False
+    try:
+        await _do_initialize(client, state)
+        await _send_initialized_notification(client, state)
+        await _wait_for_tools(client, state)
+        state.backend_ready = True
+        LOG.info("Lazy reconnect to backend succeeded")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("Lazy reconnect failed: %s", exc.__class__.__name__)
+        state.reset()
+        return False
 
 
 async def main() -> None:
