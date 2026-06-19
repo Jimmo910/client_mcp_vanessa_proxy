@@ -6,6 +6,25 @@ Stdio-прокси между Claude Code и MCP-сервером `client_mcp.cf
 
 Работает с любым MCP Streamable HTTP backend 1С на этом порту — в том числе с **объединённым расширением `client_mcp`** (`onec-client-mcp-devkit` + [`ROCTUP/1c-mcp-toolkit`](https://github.com/ROCTUP/1c-mcp-toolkit), **28 инструментов**: UI-автоматизация + интроспекция запросов/кода/метаданных). Тексты/имена не привязаны к Vanessa и настраиваются через env (`MCP_SERVER_LABEL`, `MCP_START_HINT`).
 
+## Быстрый старт
+
+Сценарий: 1С и ИИ-клиент (Claude Code) работают на одной машине; прокси крутится между ними.
+
+1. Поставить [`uv`](https://github.com/astral-sh/uv) и положить рядом `mcp-proxy-reconnect.py`.
+2. Прописать прокси в `.mcp.json` ИИ-клиента как stdio-сервер (см. «Установка» ниже):
+   ```json
+   "onec": { "type": "stdio", "command": "/путь/к/uv",
+             "args": ["run", "--script", "/путь/к/mcp-proxy-reconnect.py"] }
+   ```
+3. Запустить 1С с MCP-сервером на 9874 (для объединённого расширения
+   [mcp-1c-unified](https://github.com/Jimmo910/mcp-1c-unified)):
+   `1cv8c "/F<база>" /C"runMcp;mcpPort=9874"` (на Linux — под Xvfb).
+4. Готово. ИИ всегда видит MCP «подключённым»: пока 1С жива — вызовы идут в неё; при рестарте 1С
+   прокси переподключается сам (без `/mcp`); когда 1С выключена — `tools/list` отдаётся из кэша, а
+   на вызов инструмента приходит понятное «запусти 1С: …» вместо обрыва сессии.
+
+Команду старта 1С, которую прокси подсказывает в этом сообщении, задаёт env `MCP_START_HINT`.
+
 ## Зачем
 
 При рестарте 1С (например, после `DESIGNER /LoadCfg /UpdateDBCfg` новой версии расширения) `client_mcp.cfe` поднимает HTTP-сервер с новой `Mcp-Session-Id`. Старая сессия мертва — кэшированный в Claude Code session-id получает `HTTP 404 Session not found`. **Claude Code сам по 404 не реконнектится** (см. issue [claude-code#30224](https://github.com/anthropics/claude-code/issues/30224)) — пользователь должен вручную выполнить `/mcp`.
