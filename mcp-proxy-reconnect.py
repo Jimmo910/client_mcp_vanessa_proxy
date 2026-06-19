@@ -181,10 +181,17 @@ def _backend_down_error(request: dict, detail: str) -> dict:
     }
 
 
+# Serializes stdout writes: both the request dispatcher and the background
+# notification_pump write JSON-RPC lines to stdout, and the lines must not
+# interleave. Instantiated at import (binds to the loop on first await).
+_STDOUT_LOCK = asyncio.Lock()
+
+
 async def write_stdout(obj: dict) -> None:
     line = json.dumps(obj, ensure_ascii=False)
-    sys.stdout.buffer.write((line + "\n").encode("utf-8"))
-    sys.stdout.buffer.flush()
+    async with _STDOUT_LOCK:
+        sys.stdout.buffer.write((line + "\n").encode("utf-8"))
+        sys.stdout.buffer.flush()
 
 
 def _build_headers(state: ProxyState) -> dict[str, str]:
