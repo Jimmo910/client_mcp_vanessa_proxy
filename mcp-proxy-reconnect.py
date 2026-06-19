@@ -600,7 +600,9 @@ async def notification_pump(client: httpx.AsyncClient, state: ProxyState) -> Non
             async with client.stream(
                 "GET", BACKEND_URL, headers=headers, timeout=stream_timeout
             ) as response:
-                if response.status_code in (404, 405, 406):
+                if response.status_code in (405, 406):
+                    # Method Not Allowed / Not Acceptable — backend genuinely has
+                    # no server-push GET SSE endpoint. Stop trying.
                     state.push_disabled = True
                     LOG.info(
                         "Backend has no server-push GET SSE (HTTP %d) — pump disabled",
@@ -608,6 +610,9 @@ async def notification_pump(client: httpx.AsyncClient, state: ProxyState) -> Non
                     )
                     continue
                 if response.status_code != 200:
+                    # 404 here = stale session (e.g. right after a 1С restart);
+                    # transient — the POST path reinitializes, then we reopen with
+                    # the fresh session. Never permanently disable on this.
                     LOG.debug("Push GET returned HTTP %d — backing off", response.status_code)
                     await asyncio.sleep(backoff)
                     continue
