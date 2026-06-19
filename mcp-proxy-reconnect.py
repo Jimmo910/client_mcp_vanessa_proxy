@@ -111,6 +111,10 @@ class ProxyState:
         # When False — backend is unreachable; we serve init/tools/list from
         # disk cache. Next tool call triggers a real connect attempt.
         self.backend_ready: bool = False
+        # Sticky: set once we learn the backend has no server-push GET SSE
+        # endpoint (HTTP 405/406 or non-stream body). Keeps notification_pump
+        # dormant instead of hammering an unsupported endpoint.
+        self.push_disabled: bool = False
 
     def reset(self) -> None:
         self.session_id = None
@@ -520,16 +524,154 @@ async def _try_lazy_reconnect(
         return False
 
 
+async def _refresh_tools_cache(client: httpx.AsyncClient, state: ProxyState) -> None:
+    """Re-fetch tools/list and update the disk cache (after tools/list_changed)."""
+    if not state.backend_ready or not state.session_id:
+        return
+    try:
+        response = await client.post(
+            BACKEND_URL,
+            json={"jsonrpc": "2.0", "id": -998, "method": "tools/list"},
+            headers=_build_headers(state),
+            timeout=15,
+        )
+        response.raise_for_status()
+        parsed = _parse_response(response)
+        if parsed is not None and "result" in parsed:
+            _save_response_cache(TOOLS_CACHE_FILE, parsed)
+            count = len(parsed.get("result", {}).get("tools", []))
+            LOG.info("Tools cache refreshed after list_changed (%d tools)", count)
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("Tools cache refresh failed: %s", exc.__class__.__name__)
+
+
+async def _handle_push_payload(
+    payload: str, client: httpx.AsyncClient, state: ProxyState
+) -> None:
+    """Forward a server-initiated SSE payload (a 'data:' event) to Claude Code.
+
+    Only messages carrying a 'method' (notifications + server→client requests)
+    are forwarded; plain responses are skipped — tools/call results arrive on
+    their own POST SSE response, not here, so forwarding responses would
+    double-deliver / desync ids.
+    """
+    payload = payload.strip()
+    if not payload or payload == "[DONE]":
+        return
+    try:
+        msg = json.loads(payload)
+    except json.JSONDecodeError:
+        LOG.debug("Server-push payload not JSON: %r", payload[:200])
+        return
+    items = msg if isinstance(msg, list) else [msg]
+    for item in items:
+        if not isinstance(item, dict) or "method" not in item:
+            continue
+        await write_stdout(item)
+        method = item.get("method")
+        LOG.info("Forwarded server-push: %s", method)
+        if method == "notifications/tools/list_changed":
+            await _refresh_tools_cache(client, state)
+
+
+async def notification_pump(client: httpx.AsyncClient, state: ProxyState) -> None:
+    """Background task: long-poll the backend GET /mcp SSE stream and forward
+    server-initiated messages to Claude Code.
+
+    Resilient by design — never crashes the process: idles while 1С is down,
+    reopens the stream after restarts (new session-id), and disables itself if
+    the backend has no server-push endpoint (HTTP 405/406 or non-stream body).
+    """
+    idle_poll = 2.0   # backend not ready / no session yet
+    backoff = 5.0     # after a stream error / non-200
+    stream_timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+    while True:
+        try:
+            if state.push_disabled:
+                await asyncio.sleep(60)
+                continue
+            if not state.backend_ready or not state.session_id:
+                await asyncio.sleep(idle_poll)
+                continue
+
+            opened_session = state.session_id
+            headers = _build_headers(state)
+            headers["Accept"] = "text/event-stream"
+            async with client.stream(
+                "GET", BACKEND_URL, headers=headers, timeout=stream_timeout
+            ) as response:
+                if response.status_code in (404, 405, 406):
+                    state.push_disabled = True
+                    LOG.info(
+                        "Backend has no server-push GET SSE (HTTP %d) — pump disabled",
+                        response.status_code,
+                    )
+                    continue
+                if response.status_code != 200:
+                    LOG.debug("Push GET returned HTTP %d — backing off", response.status_code)
+                    await asyncio.sleep(backoff)
+                    continue
+                ctype = response.headers.get("Content-Type", "")
+                if "text/event-stream" not in ctype:
+                    state.push_disabled = True
+                    LOG.info(
+                        "Backend GET /mcp is not an SSE stream (Content-Type=%r) — pump disabled",
+                        ctype,
+                    )
+                    continue
+
+                LOG.info("Server-push stream opened (session=%s)", opened_session)
+                data_buf: list[str] = []
+                async for line in response.aiter_lines():
+                    # Stop if the session was rotated (restart) or backend went down.
+                    if state.session_id != opened_session or not state.backend_ready:
+                        break
+                    if line.startswith(":"):
+                        continue  # SSE comment / keep-alive
+                    if line == "":
+                        if data_buf:
+                            await _handle_push_payload("\n".join(data_buf), client, state)
+                            data_buf = []
+                        continue
+                    if line.startswith("data:"):
+                        data_buf.append(line[len("data:"):].lstrip())
+                if data_buf:
+                    await _handle_push_payload("\n".join(data_buf), client, state)
+            LOG.debug("Server-push stream closed; will reopen if backend stays ready")
+
+        except asyncio.CancelledError:
+            raise
+        except (
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
+        ) as exc:
+            LOG.debug("Server-push stream connection issue: %s", exc.__class__.__name__)
+            await asyncio.sleep(backoff)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("notification_pump unexpected error: %s", exc)
+            await asyncio.sleep(backoff)
+
+
 async def main() -> None:
     setup_logging()
     LOG.info("MCP proxy starting; backend=%s", BACKEND_URL)
     state = ProxyState()
     timeout_cfg = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout_cfg) as client:
-        async for request in read_stdin_lines():
-            # Run each request as a separate task so that a slow one doesn't
-            # block the next read. But preserve order via shared state.
-            await handle_request(client, state, request)
+        pump_task = asyncio.create_task(notification_pump(client, state))
+        try:
+            async for request in read_stdin_lines():
+                # Run each request as a separate task so that a slow one doesn't
+                # block the next read. But preserve order via shared state.
+                await handle_request(client, state, request)
+        finally:
+            pump_task.cancel()
+            try:
+                await pump_task
+            except asyncio.CancelledError:
+                pass
     LOG.info("stdin closed; exiting")
 
 
