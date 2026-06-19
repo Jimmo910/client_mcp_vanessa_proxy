@@ -5,32 +5,40 @@
 #     "httpx>=0.27",
 # ]
 # ///
-"""Persistent MCP proxy with auto-reconnect for client_mcp.cfe (Vanessa Automation).
+"""Persistent MCP proxy with auto-reconnect for the unified 1С MCP (client_mcp.cfe).
 
-Sits between Claude Code (stdio JSON-RPC) and client_mcp.cfe (HTTP Streamable on
-http://localhost:9874/mcp). When 1С restarts, the HTTP backend gets a fresh
+Sits between Claude Code (stdio JSON-RPC) and the 1С MCP server (HTTP Streamable
+on http://localhost:9874/mcp), which is started inside a 1С thin client with
+/C"runMcp;mcpPort=9874". When 1С restarts, the HTTP backend gets a fresh
 session-id; this proxy detects HTTP 404 / ConnectionError and silently
 re-initializes the backend session, retrying the original request. Claude Code's
-stdio session stays alive across all 1С restarts — no /mcp needed.
+stdio session stays alive across all 1С restarts — no /mcp reconnect needed.
 
-Limitations / notes:
-- Server-push notifications (GET /mcp SSE stream) NOT proxied yet. VA-side
-  notifications are rare; if needed, add a background task that opens a
-  long-poll GET and forwards SSE events to stdout.
-- After re-init the backend state is reset (open feature, connected TestClient
-  forgotten). LLM should re-issue setup steps if it sees unexpected state.
+When 1С is fully down, the proxy never crashes: it replays the cached initialize
+and tools/list (so the toolset stays visible) and answers tool calls with a
+graceful "1С not running, start it" error instead of dropping the session.
+
+Notes:
+- Server-push notifications (GET /mcp SSE stream) are forwarded by a background
+  task (notification_pump): server-initiated messages such as
+  notifications/tools/list_changed reach Claude Code, and the tools cache is
+  refreshed when the toolset changes.
+- After re-init the backend state is reset (open form / connected client state
+  forgotten). The LLM should re-issue setup steps if it sees unexpected state.
 
 Usage in .mcp.json:
-    "vanessa": {
+    "onec": {
         "type": "stdio",
-        "command": "python3",
-        "args": [
-            "/Users/Shared/MyWork1C_AI/.claude/skills/vanessa-bdd-deploy/scripts/mcp-proxy-reconnect.py"
-        ]
+        "command": "uv",
+        "args": ["run", "--script",
+                 "/home/artem/tools/client_mcp_vanessa_proxy/mcp-proxy-reconnect.py"]
     }
 
-Backend URL configurable via env var MCP_BACKEND_URL (default http://localhost:9874/mcp).
-Log file via MCP_PROXY_LOG (default /tmp/mcp-proxy-reconnect.log).
+Env (all optional, sane defaults):
+- MCP_BACKEND_URL   backend MCP endpoint (default http://localhost:9874/mcp)
+- MCP_PROXY_LOG     log file (default /tmp/mcp-proxy-reconnect.log)
+- MCP_SERVER_LABEL  serverInfo.name used in the offline stub (default 1c-mcp)
+- MCP_START_HINT    shell command shown to the LLM when 1С is down, to start it
 """
 from __future__ import annotations
 
@@ -46,14 +54,23 @@ import httpx
 BACKEND_URL = os.environ.get("MCP_BACKEND_URL", "http://localhost:9874/mcp")
 LOG_FILE = os.environ.get("MCP_PROXY_LOG", "/tmp/mcp-proxy-reconnect.log")
 
+# serverInfo.name reported to CC in the offline stub, and the shell command shown
+# to the LLM when 1С is down (how to bring the unified MCP back up).
+SERVER_LABEL = os.environ.get("MCP_SERVER_LABEL", "1c-mcp")
+START_HINT = os.environ.get(
+    "MCP_START_HINT",
+    'DISPLAY=:99 1cv8c "/F~/dev/mcp-run/file-db" /C"runMcp;mcpPort=9874" '
+    "/DisableStartupDialogs &",
+)
+
 # Disk caches of the last successful initialize / tools/list responses.
 # Replayed (with id substituted) to Claude Code when 1C is not running, so
 # the MCP connection always looks alive from CC's side — no /mcp reconnect needed.
 INIT_CACHE_FILE = os.environ.get(
-    "MCP_PROXY_INIT_CACHE", "/tmp/mcp-vanessa-init-cache.json"
+    "MCP_PROXY_INIT_CACHE", "/tmp/mcp-1c-init-cache.json"
 )
 TOOLS_CACHE_FILE = os.environ.get(
-    "MCP_PROXY_TOOLS_CACHE", "/tmp/mcp-vanessa-tools-cache.json"
+    "MCP_PROXY_TOOLS_CACHE", "/tmp/mcp-1c-tools-cache.json"
 )
 
 # Quick probe on initialize: if backend doesn't answer fast — respond with stub
@@ -63,10 +80,10 @@ INIT_PROBE_TIMEOUT_SEC = float(os.environ.get("MCP_PROXY_INIT_PROBE", "3"))
 RECONNECT_RETRIES = 4
 RECONNECT_DELAYS = [1, 2, 4, 8]  # seconds — total ~15s worst case
 
-# After initialize backend MCP server has only base tools (e.g. infobase_info).
-# Vanessa Automation EPF registers ~25 more tools asynchronously when it
-# finishes loading via /Execute. Wait until tools/list returns at least this
-# many entries before returning the initialize response to Claude Code.
+# Right after initialize the backend may expose only base tools (e.g.
+# infobase_info); the extension/providers register the rest asynchronously while
+# loading. Wait until tools/list returns at least this many entries before
+# returning the initialize response to Claude Code.
 WAIT_TOOLS_MIN = int(os.environ.get("MCP_PROXY_WAIT_TOOLS_MIN", "5"))
 WAIT_TOOLS_TIMEOUT_SEC = float(os.environ.get("MCP_PROXY_WAIT_TOOLS_TIMEOUT", "120"))
 WAIT_TOOLS_POLL_SEC = 1.0
@@ -129,7 +146,7 @@ def _stub_initialize_response(request: dict) -> dict:
         "result": {
             "protocolVersion": params.get("protocolVersion", "2025-03-26"),
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "vanessa (offline stub)", "version": "0.0"},
+            "serverInfo": {"name": f"{SERVER_LABEL} (offline stub)", "version": "0.0"},
         },
     }
 
@@ -154,9 +171,10 @@ def _backend_down_error(request: dict, detail: str) -> dict:
         "error": {
             "code": -32000,
             "message": (
-                "Vanessa MCP backend (1С client_mcp на localhost:9874) недоступен. "
-                "Запусти 1С через `.claude/skills/vanessa-bdd-deploy/scripts/run.sh start --db <путь>` "
-                "и повтори вызов — /mcp reconnect не нужен. "
+                "1С MCP backend (объединённое расширение client_mcp на "
+                "localhost:9874) недоступен — похоже, 1С не запущена. "
+                f"Запусти 1С: `{START_HINT}` и повтори вызов — переподключение "
+                "MCP не нужно, прокси держит сессию. "
                 f"Детали: {detail}"
             ),
         },
